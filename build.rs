@@ -1,99 +1,38 @@
-extern crate bindgen;
-
-use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
-
-// IgnoreMacros courtesy of stillinbeta:
-// https://github.com/rust-lang/rust-bindgen/issues/687#issuecomment-450750547
-#[derive(Debug)]
-struct IgnoreMacros(HashSet<String>);
-
-impl bindgen::callbacks::ParseCallbacks for IgnoreMacros {
-    fn will_parse_macro(&self, name: &str) -> bindgen::callbacks::MacroParsingBehavior {
-        if self.0.contains(name) {
-            bindgen::callbacks::MacroParsingBehavior::Ignore
-        } else {
-            bindgen::callbacks::MacroParsingBehavior::Default
-        }
-    }
-}
-
-#[derive(Clone)]
-struct Paths {
-    out_path: PathBuf,
-    out_libpath: PathBuf,
-    manifest_path: PathBuf,
-    manifest_libpath: PathBuf,
-}
-
-fn config_paths() -> Paths {
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let manifest_path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let manifest_libpath = manifest_path.join("libembroidery");
-    let out_libpath = out_path.join("libembroidery");
-
-    Paths {
-        out_path,
-        out_libpath,
-        manifest_path,
-        manifest_libpath,
-    }
-}
-
-fn build_libembroidery(p: Paths) {
-    let manifest = p.manifest_path.to_str().unwrap();
-    let manifest_lib = p.manifest_libpath.to_str().unwrap();
-    let out_lib = p.out_libpath.to_str().unwrap();
-
-    Command::new("cp")
-        .args(&["-r", manifest_lib, out_lib])
-        .current_dir(manifest)
-        .output()
-        .expect("Failed to copy libembroidery to OUT_DIR");
-    Command::new("qmake")
-        .current_dir(out_lib)
-        .output()
-        .expect("Failed to build libembroidery: qmake");
-    Command::new("make")
-        .current_dir(out_lib)
-        .output()
-        .expect("Failed to build libembroidery: make");
-}
 
 fn main() {
-    let p = config_paths();
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let lib_src = manifest_dir.join("libembroidery");
 
-    build_libembroidery(p.clone());
-    println!("Built libembroidery!");
+    // emb-outline.c contains incomplete/non-C code and must be excluded
+    let skip = ["emb-outline.c"];
+    let c_files: Vec<_> = std::fs::read_dir(&lib_src)
+        .expect("Failed to read libembroidery dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|s| s.to_str()) == Some("c")
+                && !skip.contains(&p.file_name().and_then(|s| s.to_str()).unwrap_or(""))
+        })
+        .collect();
 
-    println!(
-        "cargo:rustc-link-search={}",
-        p.out_libpath.join("lib").to_str().unwrap()
-    );
-    println!("cargo:rustc-link-lib=static=embroidery");
+    // The read-side shim lives outside libembroidery/, so add it explicitly.
+    let shim = manifest_dir.join("csrc/shim.c");
 
-    // ignore oddly definited enums in math.h
-    let ignored_macros = IgnoreMacros(
-        vec![
-            "FP_INFINITE".into(),
-            "FP_NAN".into(),
-            "FP_NORMAL".into(),
-            "FP_SUBNORMAL".into(),
-            "FP_ZERO".into(),
-            "IPPORT_RESERVED".into(),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    cc::Build::new()
+        .files(c_files.clone())
+        .file(&shim)
+        .include(&lib_src)
+        .warnings(false)
+        .compile("embroidery");
 
-    bindgen::Builder::default()
-        .header("libembroidery.h")
-        .rustfmt_bindings(false)
-        .parse_callbacks(Box::new(ignored_macros))
-        .generate()
-        .expect("Failed to build!")
-        .write_to_file(p.out_path.join("bindings.rs"))
-        .expect("Failed to write bindings!");
+    // Recompile whenever any vendored C source (or the shim) changes. Without
+    // this, edits to libembroidery/*.c are silently ignored and the stale static
+    // lib is relinked. `.file()` alone does not reliably emit these.
+    for c in &c_files {
+        println!("cargo:rerun-if-changed={}", c.display());
+    }
+    println!("cargo:rerun-if-changed={}", shim.display());
+    println!("cargo:rerun-if-changed=build.rs");
 }
