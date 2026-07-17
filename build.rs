@@ -25,6 +25,13 @@ fn main() {
         .file(&shim)
         .include(&lib_src)
         .warnings(false)
+        // libembroidery declares globals (inputArray, currentIndex, mStatus, …)
+        // in headers as tentative definitions. GCC 10+/clang default to
+        // -fno-common, which promotes each to a strong symbol, so the same
+        // global defined across translation units becomes a duplicate-symbol
+        // link error (seen with lld on Linux). -fcommon restores the merge.
+        // flag_if_supported => MSVC (which lacks the flag) silently ignores it.
+        .flag_if_supported("-fcommon")
         .compile("embroidery");
 
     // Recompile whenever any vendored C source (or the shim) changes. Without
